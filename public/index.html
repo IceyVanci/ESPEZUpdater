@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firmware Updater</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="app-title">Firmware Updater</h1>
+    <p class="sub" id="app-subtitle"></p>
+    <div class="lang-switch">
+      <button id="lang-zh" class="lang-btn" type="button">中文</button>
+      <button id="lang-en" class="lang-btn" type="button">English</button>
+    </div>
+  </header>
+
+  <div class="card" id="fw-card">
+    <div class="card-title" data-i18n="sectionFirmware">固件包信息</div>
+    <div id="variants" class="mode-select"></div>
+    <div id="fw-badge" class="badges"></div>
+    <div id="fw-info" class="muted">…</div>
+  </div>
+
+  <div class="card" id="provision-card">
+    <div class="card-title" data-i18n="sectionProvision">配网设置</div>
+    <div id="fields"></div>
+    <div id="switches" class="switch-row"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title" data-i18n="sectionOperation">升级操作</div>
+    <div class="steps">
+      <div class="step"><span class="num">1</span><span data-i18n="step1"></span></div>
+      <div class="step"><span class="num">2</span><span data-i18n="step2"></span></div>
+      <div class="step"><span class="num">3</span><span data-i18n="step3"></span></div>
+    </div>
+
+    <div id="erase-row"></div>
+
+    <div class="btn-row">
+      <button id="btn-connect" class="btn" type="button" data-i18n="btnConnect"></button>
+      <button id="btn-flash" class="btn primary" type="button" disabled data-i18n="btnFlash"></button>
+      <button id="btn-provision" class="btn" type="button" disabled data-i18n="btnProvision"></button>
+      <button id="btn-clear" class="btn danger" type="button" disabled data-i18n="btnClear"></button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div id="progress-wrap" class="hidden">
+      <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+      <div id="progress-text" class="progress-text">0%</div>
+    </div>
+
+    <div id="cred-status" class="hidden"></div>
+
+    <div id="browser-warn" class="warn hidden"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title" data-i18n="sectionLog">日志</div>
+    <pre id="log" class="log"></pre>
+  </div>
+
+  <div class="card notice">
+    <div class="card-title" data-i18n="sectionNotice">注意事项</div>
+    <ul id="notice-list"></ul>
+  </div>
+
+  <footer id="footer"></footer>
+</div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div id="modal-title" class="modal-title"></div>
+    <div id="modal-msg" class="modal-msg"></div>
+    <button id="modal-ok" class="btn primary" type="button">OK</button>
+  </div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# 构建中间物与产物（产物通常生成在项目侧；此处为工具仓内运行时的兜底忽略）
+build_tmp/
+firmware/
+dist/
+*.zip
+
+# 套件内置的运行时工具副本（项目侧，不入工具仓）
+build-kit/runtime/
+
+# 编译中间产物
+*.elf
+*.map
+sdkconfig
+*.merged.bin
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
