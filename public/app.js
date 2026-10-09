@@ -1,14 +1,27 @@
-import { ESPLoader, Transport } from './esptool-js/bundle.js';
-import { initLocale, getLocale, setLocale, onLocaleChange, t, pickI18n } from './i18n.js';
+// ============================================================================
+// app.js —— 通用固件升级工具（编排层）
+//   来源（内置 / 导入）→ profile（schema1/2）→ 渲染 → 连接 → 动作（烧录/串口）
+// ============================================================================
 
-// ============================================================================
-// DOM
-// ============================================================================
+import { ESPLoader, Transport } from './esptool-js/bundle.js';
+import { initLocale, getLocale, setLocale, setDefaultLocale, onLocaleChange, t, pickI18n } from './i18n.js';
+import { StaticSource, DirectorySource, DemoSource, sourceFromFileList, entriesFromDataTransfer } from './firmware-source.js';
+import { readZip } from './zip.js';
+import { normalizeProfile } from './profile-model.js';
+import { SerialTalker, MockTalker } from './protocol.js';
+import { computeVisibility, buildActionPayload, dataKeysOf } from './operations.js';
+import * as ui from './ui.js';
+
 const $ = id => document.getElementById(id);
+
+// ---------------------------------------------------------------- DOM
 const appTitle = $('app-title');
-const appSubtitle = $('app-subtitle');
-const btnLangZh = $('lang-zh');
-const btnLangEn = $('lang-en');
+const toolVersionEl = $('tool-version');
+const sourceBadge = $('source-badge');
+const importDrop = $('import-drop');
+const btnImport = $('btn-import');
+const fileInput = $('file-input');
+const importMsg = $('import-msg');
 const variantsEl = $('variants');
 const fwBadge = $('fw-badge');
 const fwInfo = $('fw-info');
@@ -16,9 +29,7 @@ const fieldsEl = $('fields');
 const switchesEl = $('switches');
 const eraseRow = $('erase-row');
 const btnConnect = $('btn-connect');
-const btnFlash = $('btn-flash');
-const btnProvision = $('btn-provision');
-const btnClear = $('btn-clear');
+const actionsEl = $('actions');
 const statusEl = $('status');
 const progressWrap = $('progress-wrap');
 const progressBar = $('progress-bar');
@@ -26,55 +37,28 @@ const progressText = $('progress-text');
 const credStatus = $('cred-status');
 const browserWarn = $('browser-warn');
 const logEl = $('log');
-const noticeList = $('notice-list');
-const footerEl = $('footer');
+const btnExportLog = $('btn-export-log');
 const modal = $('modal');
 const modalTitle = $('modal-title');
 const modalMsg = $('modal-msg');
 const modalOk = $('modal-ok');
 
-// ============================================================================
-// 状态
-// ============================================================================
-let rootProfile = null;      // /firmware/profile.json（项目级：变体/分组/字段/协议）
-let profile = null;          // 当前变体最终使用的 profile
-let variants = [];
-let selectedVariant = null;
+// ---------------------------------------------------------------- 状态
+const MOCK = new URLSearchParams(location.search).get('mock') === '1';
+let toolInfo = { name: 'ESPEZUpdater', version: 'dev', profileSchema: 2 };
+let source = null;
+let pkg = null;
+let profile = null;
 let manifest = null;
 
 let esploader = null;
 let transport = null;
 let selectedPort = null;
 let connected = false;
-let flashing = false;
-let provisionBusy = false;
-let pendingProvision = false; // 端口失效后等待用户重选串口继续配网
+let busy = false;
+let mockTalker = null;
 
-// ============================================================================
-// 协议映射（默认 = 方案正典；profile.protocol 可覆盖）
-// ============================================================================
-const DEFAULT_PROTOCOL = {
-  ping: 'ping',
-  pongEvt: 'pong',
-  status: 'status',
-  statusEvt: 'status',
-  credsCmd: 'creds',
-  credsSavedEvt: 'creds_saved',
-  clearCmd: 'creds_clear',
-  clearAckEvt: 'creds_saved',
-  wifiConnectingEvt: 'wifi_connecting',
-  wifiConnectedEvt: 'wifi_connected',
-  wifiFailedEvt: 'wifi_failed',
-  errorEvt: 'error'
-};
-let proto = Object.assign({}, DEFAULT_PROTOCOL);
-function refreshProto() {
-  proto = Object.assign({}, DEFAULT_PROTOCOL, (profile && profile.protocol) || {});
-}
-
-// ============================================================================
-// 通用 helpers
-// ============================================================================
+// ---------------------------------------------------------------- helpers
 function log(msg) {
   const ts = new Date().toLocaleTimeString(getLocale() === 'zh' ? 'zh-CN' : 'en-US', { hour12: false });
   logEl.textContent += `[${ts}] ${msg}\n`;
@@ -101,12 +85,6 @@ function showModal(title, msg) {
 }
 modalOk.addEventListener('click', () => modal.classList.add('hidden'));
 
-async function fetchJSON(path) {
-  const res = await fetch(path, { cache: 'no-store' });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
-}
-
 function chipRegex(chip) {
   const norm = String(chip || 'esp32c3').toLowerCase();
   const m = norm.match(/^(esp32|esp8266)(.*)$/);
@@ -115,117 +93,86 @@ function chipRegex(chip) {
   return new RegExp('(' + esc(norm) + '|' + esc(alt) + ')', 'i');
 }
 
-const fieldLabelByKey = {};
-function rebuildFieldLabelMap() {
-  Object.keys(fieldLabelByKey).forEach(k => delete fieldLabelByKey[k]);
-  ((profile && profile.fields) || []).forEach(f => {
-    fieldLabelByKey[f.key] = pickI18n(f.label) || f.key;
-  });
+function labelOf(a) {
+  return pickI18n(a.label) || (a.i18nKey ? t(a.i18nKey) : a.id);
+}
+function switchState() {
+  return { write: ui.swChecked('sw-write'), update: ui.swChecked('sw-update'), override: ui.swChecked('sw-override'), erase: ui.swChecked('sw-erase') };
+}
+function actionById(id) { return profile && profile.actions.find(a => a.id === id); }
+function submitAction() { return (profile && profile.actions.find(a => a.type === 'submit')) || null; }
+
+// ---------------------------------------------------------------- 静态文案与版本
+function applyStatic() {
+  ui.applyStaticI18n({ t, getLocale, profile, productLabel: profile ? pickI18n(profile.product) : 'Firmware' });
+  toolVersionEl.textContent = `${t('toolVersionLabel')} v${toolInfo.version}`;
+  updateSourceBadge();
+}
+function updateSourceBadge() {
+  if (!source) { sourceBadge.textContent = ''; return; }
+  if (source.kind === 'static') sourceBadge.textContent = t('sourceBuiltin');
+  else sourceBadge.textContent = t('sourceImported', { name: source.displayName });
 }
 
-// ============================================================================
-// i18n 应用到静态骨架
-// ============================================================================
-function applyStaticI18n() {
-  document.querySelectorAll('[data-i18n]').forEach(el => {
-    el.textContent = t(el.getAttribute('data-i18n'));
-  });
-  browserWarn.innerHTML = t('browserWarn');
-  noticeList.innerHTML = ['notice1', 'notice2', 'notice3', 'notice4', 'notice5', 'notice6']
-    .map(k => `<li>${t(k)}</li>`).join('');
-  footerEl.textContent = t('footer');
-  btnConnect.textContent = connected ? t('btnConnected') : (pendingProvision ? t('btnReconnect') : t('btnConnect'));
-  btnLangZh.classList.toggle('active', getLocale() === 'zh');
-  btnLangEn.classList.toggle('active', getLocale() === 'en');
-  document.documentElement.lang = getLocale() === 'zh' ? 'zh-CN' : 'en';
-  if (rootProfile) {
-    appTitle.textContent = t('title', { product: pickI18n(rootProfile.product) });
-    document.title = appTitle.textContent;
-    appSubtitle.textContent = t('subtitle');
-  } else {
-    appSubtitle.textContent = t('subtitle');
+// ---------------------------------------------------------------- 来源激活
+async function activateSource(src, opts = {}) {
+  await src.load();
+  source = src;
+  updateSourceBadge();
+  const pkgs = src.packages();
+  if (!pkgs.length) throw Object.assign(new Error('no package'), { code: 'nopackage' });
+  ui.renderVariants(variantsEl, pkgs, pkg, p => selectPackage(p), pickI18n);
+  if (opts.silent !== true) {
+    importMsg.classList.remove('err');
+    importMsg.textContent = src.kind === 'static' ? t('importMsgIdle') : t('importOk', { name: src.displayName, count: pkgs.length });
+    if (src.kind === 'dir') log(t('logSourceImported', { name: src.displayName }));
   }
-  if (statusEl.dataset.key) setStatus(t(statusEl.dataset.key, JSON.parse(statusEl.dataset.vars || '{}')), statusEl.dataset.cls || '');
-  if (!manifest) refreshFwInfoPlaceholder();
+  await selectPackage(pkgs[0]);
 }
 
-function refreshFwInfoPlaceholder() {
-  if (manifest) return;
-  fwInfo.textContent = t('loadingFirmware');
-}
-
-// ============================================================================
-// 引导 & 变体/固件加载
-// ============================================================================
-async function bootstrap() {
+async function selectPackage(p) {
+  pkg = p;
+  ui.syncVariants(variantsEl, p.id, p.group);
+  let raw;
+  try { raw = await source.profileOf(p); }
+  catch (e) { raw = null; }
+  if (!raw) { setStatus(t('firmwareNotFound', { path: p.profilePath }), 'err'); return; }
+  setDefaultLocale(raw.defaultLocale);
   try {
-    rootProfile = await fetchJSON('/firmware/profile.json');
+    profile = normalizeProfile(raw, toolInfo);
   } catch (e) {
-    fwInfo.innerHTML = `<span style="color:#d63031">${t('firmwareNotFound', { path: '/firmware/profile.json' })}</span>`;
-    log(t('firmwareNotFound', { path: '/firmware/profile.json' }));
-    return;
+    if (e.code === 'schemaTooNew') {
+      log(t('logSchemaTooNew', { got: e.got, supported: e.supported }));
+      showModal('⚠', t('logSchemaTooNew', { got: e.got, supported: e.supported }));
+      profile = null;
+      return;
+    }
+    throw e;
   }
-  appTitle.textContent = t('title', { product: pickI18n(rootProfile.product) });
-  document.title = appTitle.textContent;
-  variants = (rootProfile.variants && rootProfile.variants.length)
-    ? rootProfile.variants
-    : [{ id: '', label: pickI18n(rootProfile.product) }];
-  renderVariants();
-  await selectVariant(variants[0]);
-}
-
-function basePathFor(v) {
-  return (v && v.id) ? `/firmware/${v.id}/` : '/firmware/';
-}
-
-function renderVariants() {
-  variantsEl.innerHTML = '';
-  if (variants.length <= 1 && variants[0] && !variants[0].id) {
-    variantsEl.classList.add('hidden');
-    return;
-  }
-  variantsEl.classList.remove('hidden');
-  variants.forEach(v => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'mode-btn';
-    b.textContent = pickI18n(v.label) || v.id;
-    b.addEventListener('click', () => selectVariant(v));
-    b.dataset.vid = v.id == null ? '' : v.id;
-    variantsEl.appendChild(b);
+  applyStatic();
+  ui.renderSwitches(switchesEl, eraseRow, profile, t);
+  ui.renderFields(fieldsEl, profile, p.id, pickI18n);
+  fieldsEl.querySelectorAll('input,select,textarea').forEach(el => {
+    el.addEventListener('input', () => ui.applyShowWhen(profile, ui.getControlValue));
+    el.addEventListener('change', () => ui.applyShowWhen(profile, ui.getControlValue));
   });
-  syncVariantButtons();
-}
-function syncVariantButtons() {
-  [...variantsEl.children].forEach(b => {
-    b.classList.toggle('active', selectedVariant && (b.dataset.vid === (selectedVariant.id == null ? '' : selectedVariant.id)));
+  ui.applyShowWhen(profile, ui.getControlValue);
+  ui.renderActions(actionsEl, profile.actions, {
+    t, pickI18n, labelOf,
+    onAction: a => { if (a.type === 'flash') doFlash(); else doSerialAction(a); }
   });
-}
-
-async function selectVariant(v) {
-  selectedVariant = v;
-  syncVariantButtons();
-  const base = basePathFor(v);
-  // 优先使用变体自带 profile，其次项目级
-  try { profile = await fetchJSON(base + 'profile.json'); }
-  catch (e) { profile = rootProfile; }
-  refreshProto();
-  rebuildFieldLabelMap();
-  renderSwitches();
-  renderFields();
-  log(t('logSwitched', { label: pickI18n(v.label) || v.id || '' }));
+  log(t('logSwitched', { label: (p.group ? p.group + ' · ' : '') + (pickI18n(p.label) || p.id) }));
   await loadManifest();
+  refreshActionButtons();
 }
 
 async function loadManifest() {
-  const base = basePathFor(selectedVariant);
-  try {
-    manifest = await fetchJSON(base + 'manifest.json');
-  } catch (e) {
-    manifest = null;
-    fwBadge.innerHTML = '';
-    fwInfo.innerHTML = `<span style="color:#d63031">${t('firmwareNotFound', { path: base + 'manifest.json' })}</span>`;
-    log(t('firmwareNotFound', { path: base + 'manifest.json' }));
+  manifest = null;
+  fwBadge.innerHTML = '';
+  try { manifest = await source.manifest(pkg); } catch (e) { manifest = null; }
+  if (!manifest) {
+    fwInfo.innerHTML = `<span style="color:#d63031">${t('firmwareNotFound', { path: pkg.manifestPath })}</span>`;
+    log(t('firmwareNotFound', { path: pkg.manifestPath }));
     return;
   }
   const empty = (manifest.credentials === 'empty');
@@ -245,335 +192,87 @@ async function loadManifest() {
   log(t('logPackageLoaded', { version: manifest.version, mode: manifest.flash.mode, freq: manifest.flash.freq, size: manifest.flash.size }));
 }
 
-// ============================================================================
-// 渲染：开关
-// ============================================================================
-function renderSwitches() {
-  switchesEl.innerHTML = '';
-  eraseRow.innerHTML = '';
-  const sw = (profile && profile.switches) || {};
-  ['write', 'update', 'override'].forEach(key => {
-    const def = sw[key] || {};
-    if (def.visible === false) return;
-    switchesEl.appendChild(makeSwitch(`sw-${key}`, t('sw' + key.charAt(0).toUpperCase() + key.slice(1)), t('sw' + key.charAt(0).toUpperCase() + key.slice(1) + 'Help'), def.default !== false));
-  });
-  // erase 开关（位于操作区）
-  const edef = sw.erase || {};
-  if (edef.visible !== false) {
-    const lbl = document.createElement('label');
-    lbl.className = 'switch inline';
-    lbl.innerHTML = `<input id="sw-erase" type="checkbox"${edef.default !== false ? ' checked' : ''}>` +
-      `<span>${t('swErase')}</span><em>${t('swEraseHelp')}</em>`;
-    eraseRow.appendChild(lbl);
+// ---------------------------------------------------------------- 按钮状态
+function refreshActionButtons() {
+  if (!profile) { actionsEl.innerHTML = ''; return; }
+  const btns = [...actionsEl.querySelectorAll('button')];
+  for (const b of btns) {
+    const a = actionById(b.dataset.action);
+    if (!a) continue;
+    if (a.type === 'flash') b.disabled = !(connected && manifest && !busy);
+    else b.disabled = !(connected && !busy);
   }
+  btnConnect.disabled = connected || busy;
+  btnConnect.textContent = connected ? t('btnConnected') : t('btnConnect');
 }
-function makeSwitch(id, label, help, checked) {
-  const l = document.createElement('label');
-  l.className = 'switch';
-  l.innerHTML = `<input id="${id}" type="checkbox"${checked ? ' checked' : ''}>` +
-    `<span>${label}</span><em>${help}</em>`;
-  return l;
-}
-function swChecked(id) { const el = $(id); return el ? el.checked : false; }
+function setBusy(v) { busy = v; refreshActionButtons(); }
 
-// ============================================================================
-// 渲染：字段（分组 + variants 过滤 + showWhen）
-// ============================================================================
-function variantId() { return selectedVariant ? (selectedVariant.id == null ? '' : selectedVariant.id) : ''; }
-function fieldInVariant(f) {
-  if (!f.variants || !f.variants.length) return true;
-  return f.variants.includes(variantId());
-}
-function groupInVariant(g) {
-  if (!g.variants || !g.variants.length) return true;
-  return g.variants.includes(variantId());
-}
-
-function renderFields() {
-  fieldsEl.innerHTML = '';
-  const groups = (profile && profile.groups) || [];
-  const fields = (profile && profile.fields) || [];
-  const used = new Set();
-  groups.filter(groupInVariant).forEach(g => {
-    const members = fields.filter(f => fieldInVariant(f) && f.group === g.id);
-    if (!members.length) return;
-    const title = document.createElement('div');
-    title.className = 'group-title';
-    title.textContent = pickI18n(g.label) || g.id;
-    fieldsEl.appendChild(title);
-    const box = document.createElement('div');
-    fieldsEl.appendChild(box);
-    members.forEach(f => { used.add(f.key); box.appendChild(makeField(f)); });
-  });
-  const rest = fields.filter(f => fieldInVariant(f) && !used.has(f.key));
-  rest.forEach(f => fieldsEl.appendChild(makeField(f)));
-
-  // showWhen 初始 + 变更监听
-  fieldsEl.querySelectorAll('input,select,textarea').forEach(el => {
-    el.addEventListener('input', applyShowWhen);
-    el.addEventListener('change', applyShowWhen);
-  });
-  applyShowWhen();
-}
-
-function makeField(f) {
-  const wrap = document.createElement('div');
-  wrap.className = 'field';
-  wrap.id = 'wrap-' + f.key;
-  wrap.dataset.key = f.key;
-  const label = document.createElement('label');
-  label.textContent = pickI18n(f.label) || f.key;
-  label.setAttribute('for', 'cfg-' + f.key);
-  wrap.appendChild(label);
-
-  const type = f.type || 'text';
-  const ph = pickI18n(f.placeholder);
-  const help = f.help ? pickI18n(f.help) : '';
-
-  if (type === 'textarea') {
-    const ta = document.createElement('textarea');
-    ta.id = 'cfg-' + f.key;
-    ta.rows = 3; ta.spellcheck = false;
-    if (ph) ta.placeholder = ph;
-    if (f.default != null) ta.value = f.default;
-    if (f.maxlength) ta.maxLength = f.maxlength;
-    wrap.appendChild(ta);
-  } else if (type === 'radio') {
-    const row = document.createElement('div');
-    row.className = 'radio-row';
-    (f.options || []).forEach(opt => {
-      const l = document.createElement('label');
-      l.className = 'radio';
-      const checked = (f.default != null ? f.default : (f.options[0] && f.options[0].value)) === opt.value;
-      l.innerHTML = `<input type="radio" name="f-${f.key}" value="${opt.value}"${checked ? ' checked' : ''}>` +
-        `<span>${pickI18n(opt.label) || opt.value}</span>`;
-      row.appendChild(l);
+// ---------------------------------------------------------------- 导入交互
+function showImportError(err) {
+  importMsg.classList.add('err');
+  if (err && err.code === 'scan' && err.errors) {
+    const items = err.errors.map(e => {
+      if (e.type === 'missingProfile' || e.type === 'missingManifest') return t('importMissing', { file: e.file });
+      if (e.type === 'unexpectedManifest') return t('importUnexpected', { file: e.file });
+      return e.file;
     });
-    wrap.appendChild(row);
-  } else if (type === 'select') {
-    const sel = document.createElement('select');
-    sel.id = 'cfg-' + f.key;
-    (f.options || []).forEach(opt => {
-      const o = document.createElement('option');
-      o.value = opt.value;
-      o.textContent = pickI18n(opt.label) || opt.value;
-      sel.appendChild(o);
-    });
-    if (f.default != null) sel.value = f.default;
-    wrap.appendChild(sel);
-  } else if (type === 'checkbox') {
-    const l = document.createElement('label');
-    l.className = 'radio';
-    l.innerHTML = `<input type="checkbox" id="cfg-${f.key}"${f.default === 'true' || f.default === true ? ' checked' : ''}><span>${ph || ''}</span>`;
-    wrap.appendChild(l);
+    importMsg.innerHTML = `${t('importStrictError')}<ul>${items.map(i => `<li>${i}</li>`).join('')}</ul>`;
+  } else if (err && err.code === 'nopackage') {
+    importMsg.textContent = t('importNoPackage');
   } else {
-    const inp = document.createElement('input');
-    inp.type = (type === 'number') ? 'number' : (f.sensitive || type === 'password' ? 'password' : 'text');
-    inp.id = 'cfg-' + f.key;
-    inp.autocomplete = 'off';
-    if (ph) inp.placeholder = ph;
-    if (f.default != null && f.default !== '') inp.value = f.default;
-    if (f.maxlength) inp.maxLength = f.maxlength;
-    if (f.min != null) inp.min = f.min;
-    if (f.max != null) inp.max = f.max;
-    wrap.appendChild(inp);
+    importMsg.textContent = t('importZipFail', { msg: err && err.message ? err.message : err });
   }
-
-  if (help) {
-    const h = document.createElement('div');
-    h.className = 'help';
-    h.textContent = help;
-    wrap.appendChild(h);
-  }
-  return wrap;
 }
 
-function getControlValue(key) {
-  const radios = document.getElementsByName('f-' + key);
-  if (radios && radios.length) {
-    const c = [...radios].find(r => r.checked);
-    return c ? c.value : '';
+async function importEntries(entries, displayName) {
+  try {
+    await activateSource(new DirectorySource(entries, displayName));
+  } catch (err) {
+    showImportError(err);
+    log(t('importStrictError') + ' ' + (err && err.message ? err.message : err));
   }
-  const el = $('cfg-' + key);
-  if (!el) return '';
-  if (el.type === 'checkbox') return el.checked ? 'true' : '';
-  return (el.value || '').trim();
 }
 
-function captureValues() {
-  const out = {};
-  ((profile && profile.fields) || []).forEach(f => {
-    const v = getControlValue(f.key);
-    if (v !== '' && v != null) out[f.key] = v;
-  });
-  return out;
-}
-function setControlValue(key, val) {
-  const radios = document.getElementsByName('f-' + key);
-  if (radios && radios.length) {
-    const r = [...radios].find(x => x.value === val);
-    if (r) r.checked = true;
-    return;
-  }
-  const el = $('cfg-' + key);
-  if (!el) return;
-  if (el.type === 'checkbox') el.checked = (val === 'true');
-  else el.value = val;
-}
+btnImport.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', async () => {
+  if (!fileInput.files || !fileInput.files.length) return;
+  const src = sourceFromFileList(fileInput.files, '');
+  try { await activateSource(src); }
+  catch (err) { showImportError(err); }
+  fileInput.value = '';
+});
 
-function applyShowWhen() {
-  ((profile && profile.fields) || []).forEach(f => {
-    if (!f.showWhen) return;
-    const wrap = $('wrap-' + f.key);
-    if (!wrap) return;
-    let visible = true;
-    for (const [dep, want] of Object.entries(f.showWhen)) {
-      if (getControlValue(dep) !== want) { visible = false; break; }
+['dragenter', 'dragover'].forEach(ev => importDrop.addEventListener(ev, e => {
+  e.preventDefault(); importDrop.classList.add('drop-active');
+}));
+['dragleave', 'drop'].forEach(ev => importDrop.addEventListener(ev, e => {
+  e.preventDefault(); importDrop.classList.remove('drop-active');
+}));
+importDrop.addEventListener('drop', async e => {
+  const files = [...(e.dataTransfer.files || [])];
+  try {
+    if (files.length === 1 && /\.zip$/i.test(files[0].name)) {
+      const map = await readZip(await files[0].arrayBuffer());
+      const entries = [...map].map(([path, bytes]) => ({ path, bytes }));
+      await importEntries(entries, files[0].name.replace(/\.zip$/i, ''));
+      return;
     }
-    wrap.classList.toggle('hidden', !visible);
-  });
+    const { entries, displayName } = await entriesFromDataTransfer(e.dataTransfer.items);
+    await importEntries(entries, displayName);
+  } catch (err) {
+    showImportError(err);
+  }
+});
+
+// ---------------------------------------------------------------- 串口工具
+function attachLog(talker) {
+  talker.onEvent = msg => log(t('logDeviceMsg', { msg: JSON.stringify(msg) }));
+  talker.onLine = line => log(t('logDevice', { line }));
+  talker.onParseFail = line => log(t('logParseFail', { line }));
+  talker.onSend = (obj, line) => log(t('logSend', { msg: line }));
 }
 
-// ============================================================================
-// 凭据负载
-// ============================================================================
-function buildCredsPayload() {
-  const p = {
-    cmd: proto.credsCmd,
-    write: true,
-    update: swChecked('sw-update'),
-    override: swChecked('sw-override')
-  };
-  ((profile && profile.fields) || []).forEach(f => {
-    if (!fieldInVariant(f)) return;
-    const wrap = $('wrap-' + f.key);
-    if (wrap && wrap.classList.contains('hidden')) return;
-    const v = getControlValue(f.key);
-    if (v === '' || v == null) return;
-    if (f.type === 'number') {
-      const n = parseInt(v, 10);
-      if (!isNaN(n)) p[f.key] = n;
-    } else {
-      p[f.key] = v;
-    }
-  });
-  return p;
-}
-
-// ============================================================================
-// 设备状态渲染（富 groups / 扁平）
-// ============================================================================
-function pill(b) { return b ? `<span class="pill y">${t('yes')}</span>` : `<span class="pill n">${t('no')}</span>`; }
-function stateLabel(s) {
-  const map = { provision: 'stateProvision', connecting: 'stateConnecting', connected: 'stateConnected', failed: 'stateFailed', disconnected: 'stateDisconnected' };
-  return map[s] ? t(map[s]) : (s || '-');
-}
-
-function renderStatus(st) {
-  if (!st) { credStatus.classList.add('hidden'); return; }
-  rebuildFieldLabelMap();
-  if (st.groups) {
-    let rows = '';
-    for (const [name, v] of Object.entries(st.groups)) {
-      const label = fieldLabelByKey[name] || name;
-      const val0 = (v.value !== undefined && v.value !== '') ? String(v.value) : '-';
-      rows += `<tr><td class="mono">${label}</td><td>${pill(v.compile)}</td><td>${pill(v.nvs)}</td>` +
-              `<td>${v.ovr ? t('on') : t('off')}</td><td class="v">${val0}</td></tr>`;
-    }
-    const wifi = st.wifi != null ? st.wifi : (st.state != null ? stateLabel(st.state) : '-');
-    const ip = st.ip ? '（IP ' + st.ip + '）' : '';
-    credStatus.innerHTML =
-      `<div class="card-title" style="margin-top:12px">${t('sectionStatus')}</div>` +
-      `<table class="cred"><tr><th>${t('thGroup')}</th><th>${t('thCompile')}</th><th>${t('thNvs')}</th><th>${t('thOverride')}</th><th>${t('thValue')}</th></tr>${rows}</table>` +
-      `<div class="muted" style="margin-top:6px">${t('logCredsStatusNote', { wifi, ip })}</div>`;
-  } else {
-    const wifi = st.state != null ? stateLabel(st.state) : '-';
-    const ip = (st.state === 'connected' && st.ip) ? '（' + st.ip + '）' : '';
-    credStatus.innerHTML =
-      `<div class="card-title" style="margin-top:12px">${t('sectionStatus')}</div>` +
-      `<div class="muted">${t('thCompile')}: ${st.compile ? t('yes') : t('no')} ｜ ` +
-      `${t('thNvs')}: ${st.nvs ? t('yes') : t('no')} ｜ ${t('thOverride')}: ${st.override ? t('on') : t('off')} ｜ ` +
-      `${t('wifiLabel')}: ${wifi}${ip}</div>`;
-  }
-  credStatus.classList.remove('hidden');
-}
-
-// ============================================================================
-// 串口配网会话
-// ============================================================================
-class SerialTalker {
-  constructor(port) {
-    this.port = port;
-    this.reader = null;
-    this.writer = null;
-    this.buf = '';
-    this.events = [];
-    this.waiters = [];
-    this.onEvent = null;
-  }
-  async open(baud = 115200) {
-    await this.port.open({ baudRate: baud, bufferSize: 8192 });
-    this.reader = this.port.readable.getReader();
-    this.writer = this.port.writable.getWriter();
-    this._pump();
-  }
-  async _pump() {
-    try {
-      while (true) {
-        const { value, done } = await this.reader.read();
-        if (done) break;
-        if (value && value.length) this._feed(new TextDecoder().decode(value));
-      }
-    } catch (e) { /* 端口关闭 */ }
-  }
-  _feed(text) {
-    this.buf += text;
-    let idx;
-    while ((idx = this.buf.indexOf('\n')) >= 0) {
-      let line = this.buf.slice(0, idx);
-      this.buf = this.buf.slice(idx + 1);
-      line = line.replace(/\r$/, '');
-      if (!line) continue;
-      if (line.startsWith('@')) this._event(line);
-      else log(t('logDevice', { line: line.trim() }));
-    }
-  }
-  _event(line) {
-    let msg;
-    try { msg = JSON.parse(line.slice(1)); } catch (e) { log(t('logParseFail', { line })); return; }
-    log(t('logDeviceMsg', { msg: JSON.stringify(msg) }));
-    this.events.push(msg);
-    if (this.onEvent) this.onEvent(msg);
-    const hit = this.waiters.filter(w => w.evt === msg.evt);
-    this.waiters = this.waiters.filter(w => w.evt !== msg.evt);
-    hit.forEach(w => { clearTimeout(w.timer); w.resolve(msg); });
-  }
-  resetEvents() { this.events = []; }
-  waitFor(evt, timeoutMs = 15000) {
-    const past = this.events.filter(e => e.evt === evt).pop();
-    if (past) return Promise.resolve(past);
-    return new Promise((resolve, reject) => {
-      const w = { evt, resolve };
-      w.timer = setTimeout(() => {
-        this.waiters = this.waiters.filter(x => x !== w);
-        reject(new Error(evt + ' timeout'));
-      }, timeoutMs);
-      this.waiters.push(w);
-    });
-  }
-  async send(obj) {
-    const line = '@' + JSON.stringify(obj) + '\n';
-    log(t('logSend', { msg: line.trim() }));
-    await this.writer.write(new TextEncoder().encode(line));
-  }
-  async close() {
-    try { if (this.reader) await this.reader.cancel(); } catch (e) {}
-    try { if (this.writer) await this.writer.releaseLock(); } catch (e) {}
-    try { await this.port.close(); } catch (e) {}
-  }
-}
-
-async function openWithRetry(port, tries = 12, gapMs = 500) {
+async function openSerialWithRetry(port, tries = 12, gapMs = 500) {
   for (let i = 0; i < tries; i++) {
     try {
       const tk = new SerialTalker(port);
@@ -587,107 +286,18 @@ async function openWithRetry(port, tries = 12, gapMs = 500) {
   }
 }
 
-async function provisionOnPort(port) {
-  let talker = null;
-  try {
-    log(t('logProvisionOpen', { baud: 115200 }));
-    talker = await openWithRetry(port);
-
-    let pong = null;
-    for (let i = 0; i < 15 && !pong; i++) {
-      talker.resetEvents();
-      await talker.send({ cmd: proto.ping });
-      try { pong = await talker.waitFor(proto.pongEvt, 1000); } catch (e) {}
-    }
-    if (!pong) throw new Error(t('errNoResponse'));
-    log(t('logDeviceResponded', { fw: pong.fw || '?', mode: pong.mode || '-' }));
-
-    if (profile && profile.proto != null && pong.proto != null && pong.proto !== profile.proto) {
-      throw new Error(t('errProtoMismatch', { proto: pong.proto, expected: profile.proto }));
-    }
-    if (pong.mode != null && selectedVariant && selectedVariant.id && pong.mode !== selectedVariant.id) {
-      log(t('logModeMismatch', { device: pong.mode, selected: selectedVariant.id }));
-    }
-
-    talker.resetEvents();
-    await talker.send({ cmd: proto.status });
-    const st = await talker.waitFor(proto.statusEvt, 3000).catch(() => null);
-    if (st) renderStatus(st);
-
-    if (!swChecked('sw-write')) {
-      log(t('logSkipWrite'));
-      return { pong, skippedAll: true };
-    }
-
-    const payload = buildCredsPayload();
-    const keys = Object.keys(payload).filter(k => !['cmd', 'write', 'update', 'override'].includes(k));
-    if (keys.length === 0) {
-      log(t('logSkipNoCreds'));
-      return { pong, skippedAll: true };
-    }
-
-    talker.resetEvents();
-    await talker.send(payload);
-    const saved = await talker.waitFor(proto.credsSavedEvt, 5000);
-    const written = (saved.groups || []).join(', ') || '-';
-    if (saved.skipped && saved.skipped.length) {
-      log(t('logCredsSavedSkip', { written, skipped: saved.skipped.join(', ') }));
-    } else {
-      log(t('logCredsSaved', { written }));
-    }
-
-    const hasSsid = !!(payload.ssid);
-    if (hasSsid) {
-      setStatus(t('stProvisioningWait'));
-      const evt = await talker.waitFor([proto.wifiConnectedEvt, proto.wifiFailedEvt, proto.errorEvt], 45000).catch(() => null);
-      if (evt && evt.evt === proto.wifiConnectedEvt) {
-        log(t('logWifiConnected', { ip: evt.ip }));
-      } else if (evt && evt.evt === proto.wifiFailedEvt) {
-        log(t('logWifiTimeoutStatus', { status: evt.status }));
-        return { pong, wifiOk: false };
-      } else if (evt && evt.evt === proto.errorEvt) {
-        throw new Error(t('errDeviceError', { msg: evt.msg || 'unknown' }));
-      } else {
-        log(t('logWifiTimeout'));
-        return { pong, wifiOk: false };
-      }
-    }
-    return { pong, wifiOk: true };
-  } finally {
-    if (talker) await talker.close();
-  }
+function newMockTalker() {
+  return new MockTalker({ protocol: profile.protocol, variantId: pkg.id, proto: profile.proto });
 }
 
-async function clearOnPort(port) {
-  let talker = null;
-  try {
-    talker = await openWithRetry(port);
-    talker.resetEvents();
-    await talker.send({ cmd: proto.clearCmd, groups: ['all'] });
-    const ack = await talker.waitFor(proto.clearAckEvt, 5000).catch(() => null);
-    if (!ack) throw new Error(t('errClearTimeout', { evt: proto.clearAckEvt }));
-    log(t('logCleared'));
-    talker.resetEvents();
-    await talker.send({ cmd: proto.status });
-    const st = await talker.waitFor(proto.statusEvt, 3000).catch(() => null);
-    renderStatus(st);
-  } finally {
-    if (talker) await talker.close();
-  }
-}
-
-// ============================================================================
-// esptool 连接 / 烧录
-// ============================================================================
+// ---------------------------------------------------------------- 连接
 btnConnect.addEventListener('click', async () => {
-  if (pendingProvision) {
-    try {
-      selectedPort = await navigator.serial.requestPort();
-      pendingProvision = false;
-      btnConnect.textContent = t('btnConnect');
-      setStatus(t('reopenHint'), 'ok');
-      await runProvisionOnly();
-    } catch (e) { log(t('logConnectFailed', { msg: e && e.message ? e.message : e })); }
+  if (busy) return;
+  if (MOCK) {
+    connected = true;
+    setStatus(t('stConnected', { chip: 'MOCK' }), 'ok');
+    log(t('logChip', { chip: 'MOCK' }));
+    refreshActionButtons();
     return;
   }
   if (connected) return;
@@ -712,20 +322,16 @@ btnConnect.addEventListener('click', async () => {
     const chip = await esploader.main();
     log(t('logChip', { chip }));
     const expect = (manifest && manifest.chip) || 'esp32c3';
-    if (!chipRegex(expect).test(chip)) {
-      throw new Error(t('errChipNotMatch', { expect, chip }));
-    }
+    if (!chipRegex(expect).test(chip)) throw new Error(t('errChipNotMatch', { expect, chip }));
     connected = true;
     setStatus(t('stConnected', { chip }), 'ok');
-    btnFlash.disabled = false;
-    btnProvision.disabled = false;
-    btnClear.disabled = false;
-    btnConnect.textContent = t('btnConnected');
+    refreshActionButtons();
   } catch (e) {
     log(t('logConnectFailed', { msg: e && e.message ? e.message : e }));
     setStatus(t('stConnectFail'), 'err');
     await releasePort();
-    btnConnect.disabled = false;
+  } finally {
+    refreshActionButtons();
   }
 });
 
@@ -740,59 +346,186 @@ async function releasePort() {
       await sleep(100);
     }
   }
+  refreshActionButtons();
 }
 
-btnFlash.addEventListener('click', async () => {
-  if (!connected || flashing) return;
-  if (!manifest) { setStatus(t('stNoManifest'), 'err'); return; }
-  flashing = true;
-  btnFlash.disabled = true;
-  btnProvision.disabled = true;
-  btnClear.disabled = true;
-  btnConnect.disabled = true;
-  const base = basePathFor(selectedVariant);
-  const doErase = swChecked('sw-erase');
+async function ensureSerialPort() {
+  if (MOCK) return;
+  if (transport || connected) { await releasePort(); await sleep(800); }
+  if (!selectedPort) {
+    setStatus(t('stSelectPort'));
+    selectedPort = await navigator.serial.requestPort();
+  }
+}
+
+async function openTalker() {
+  if (MOCK) {
+    if (!mockTalker) mockTalker = newMockTalker();
+    const tk = mockTalker;
+    attachLog(tk);
+    await tk.open();
+    return tk;
+  }
+  const tk = await openSerialWithRetry(selectedPort);
+  attachLog(tk);
+  return tk;
+}
+
+// ---------------------------------------------------------------- 串口会话
+async function runSession(talker, action) {
+  const proto = profile.protocol;
+  let pong = null;
+  for (let i = 0; i < 15 && !pong; i++) {
+    talker.resetEvents();
+    await talker.send({ cmd: proto.ping });
+    try { pong = await talker.waitFor(proto.pongEvt, 1000); } catch (e) {}
+  }
+  if (!pong) throw new Error(t('errNoResponse'));
+  log(t('logDeviceResponded', { fw: pong.fw || '?', mode: pong.mode || '-' }));
+  if (profile.proto != null && pong.proto != null && pong.proto !== profile.proto) {
+    throw new Error(t('errProtoMismatch', { proto: pong.proto, expected: profile.proto }));
+  }
+  if (pong.mode != null && pkg && pkg.id && pong.mode !== pkg.id) {
+    log(t('logModeMismatch', { device: pong.mode, selected: pkg.id }));
+  }
+
+  talker.resetEvents();
+  await talker.send({ cmd: proto.status });
+  const st0 = await talker.waitFor(proto.statusEvt, 3000).catch(() => null);
+  if (st0) ui.renderStatus(credStatus, st0, profile.statusView, profile, { t, pickI18n });
+
+  if (action.gate && !ui.swChecked('sw-' + action.gate)) {
+    log(t('logActionSkip', { sw: t('sw' + action.gate.charAt(0).toUpperCase() + action.gate.slice(1)) }));
+    return { pong, skipped: true };
+  }
+  if (!action.command) {
+    if (action.type !== 'flash') throw new Error(t('errActionNoCommand', { id: action.id }));
+    return { pong, skipped: true };
+  }
+
+  const visibility = computeVisibility(profile, pkg.id, ui.getControlValue);
+  const payload = buildActionPayload(action, profile, {
+    switches: switchState(), getValue: ui.getControlValue, visibility
+  });
+  const dataKeys = dataKeysOf(payload);
+  if (action.type === 'submit' && dataKeys.length === 0) {
+    log(t('logActionNoData'));
+    return { pong, skipped: true };
+  }
+
+  talker.resetEvents();
+  await talker.send(payload);
+  if (action.waitFor && action.waitFor.length) {
+    let saved = null;
+    try { saved = await talker.waitFor(action.waitFor, action.timeoutMs || 8000); }
+    catch (e) { throw new Error(t('errActionTimeout', { evt: action.waitFor.join(' / ') })); }
+    if (saved && (saved.groups || saved.skipped)) {
+      const written = (saved.groups || []).join(', ') || '-';
+      if (saved.skipped && saved.skipped.length) log(t('logCredsSavedSkip', { written, skipped: saved.skipped.join(', ') }));
+      else log(t('logCredsSaved', { written }));
+    }
+  }
+
+  let wifiOk;
+  if (action.followUp && action.followUp.waitFor &&
+      (!action.followUp.ifField || payload[action.followUp.ifField])) {
+    setStatus(t('stProvisioningWait'));
+    const evt = await talker.waitFor(action.followUp.waitFor, action.followUp.timeoutMs || 45000).catch(() => null);
+    if (evt && evt.evt === proto.wifiConnectedEvt) { log(t('logWifiConnected', { ip: evt.ip })); wifiOk = true; }
+    else if (evt && evt.evt === proto.wifiFailedEvt) { log(t('logWifiTimeoutStatus', { status: evt.status })); wifiOk = false; }
+    else if (evt && evt.evt === proto.errorEvt) { throw new Error(t('errDeviceError', { msg: evt.msg || 'unknown' })); }
+    else { log(t('logWifiTimeout')); wifiOk = false; }
+  }
+
+  talker.resetEvents();
+  await talker.send({ cmd: proto.status });
+  const st1 = await talker.waitFor(proto.statusEvt, 3000).catch(() => null);
+  if (st1) ui.renderStatus(credStatus, st1, profile.statusView, profile, { t, pickI18n });
+
+  return { pong, wifiOk, skipped: false };
+}
+
+async function doSerialAction(action) {
+  if (busy) return;
+  setBusy(true);
+  let talker = null;
+  try {
+    setStatus(t('stActionDoing', { label: labelOf(action) }));
+    await ensureSerialPort();
+    talker = await openTalker();
+    const r = await runSession(talker, action);
+    if (r.skipped) setStatus(t('stProvisionDoneNoCreds'), 'ok');
+    else if (r.wifiOk === false) setStatus(t('stProvisionWifiFail'), 'err');
+    else if (action.id === 'clear' || action.command === profile.protocol.clearCmd) setStatus(t('stCleared'), 'ok');
+    else setStatus(t('stProvisionDone'), 'ok');
+  } catch (e) {
+    log(t('logProvisionFailed', { msg: e && e.message ? e.message : e }));
+    setStatus(t('stProvisionFail', { msg: e && e.message ? e.message : e }), 'err');
+  } finally {
+    if (talker) await talker.close();
+    setBusy(false);
+  }
+}
+
+// ---------------------------------------------------------------- 烧录
+async function doFlash() {
+  if (busy || !manifest) return;
+  if (!MOCK && (!connected || !esploader)) return;
+  setBusy(true);
+  const doErase = ui.swChecked('sw-erase');
   try {
     setStatus(t('stVerifying'));
     const fileArray = [];
     for (let i = 0; i < manifest.files.length; i++) {
       const f = manifest.files[i];
       setProgress(i / manifest.files.length * 5, t('stReading', { name: f.name }));
-      const res = await fetch(base + f.name, { cache: 'no-store' });
-      if (!res.ok) throw new Error(t('errReadFile', { name: f.name, status: res.status }));
-      const buf = await res.arrayBuffer();
-      const hex = await sha256Hex(buf);
-      if (hex !== String(f.sha256).toLowerCase()) throw new Error(t('errSha', { name: f.name }));
-      log(t('logShaOk', { name: f.name, kb: (buf.byteLength / 1024).toFixed(1) }));
-      fileArray.push({ data: new Uint8Array(buf), address: f.offset });
-    }
-    const fl = manifest.flash || {};
-    const flashMode = fl.mode || 'dio', flashFreq = fl.freq || '80m', flashSize = fl.size || '4MB';
-    setStatus(t('stFlashing'));
-    log(t('logFlashing', {
-      variant: variantId() || '-', mode: flashMode, freq: flashFreq, size: flashSize,
-      erase: doErase ? t('eraseYes') : t('eraseNo')
-    }));
-    await esploader.writeFlash({
-      fileArray, flashMode, flashFreq, flashSize, eraseAll: doErase, compress: true,
-      reportProgress: (fileIndex, written, total) => {
-        const b = fileIndex / fileArray.length * 90;
-        const span = 1 / fileArray.length * 90;
-        setProgress(b + written / total * span);
+      const buf = await source.bytes(pkg, f.name);
+      if (!MOCK) {
+        const hex = await sha256Hex(buf);
+        if (hex !== String(f.sha256).toLowerCase()) throw new Error(t('errSha', { name: f.name }));
       }
-    });
-    log(t('logWriteDone'));
-    setProgress(100, t('stRestart'));
-    try { await esploader.after('hard_reset'); } catch (e) { log(t('logResetHint', { msg: e })); }
-    await releasePort();
-    await sleep(2000);
+      log(t('logShaOk', { name: f.name, kb: (buf.byteLength / 1024).toFixed(1) }));
+      fileArray.push({ data: buf, address: f.offset });
+    }
+
+    if (MOCK) {
+      setStatus(t('stFlashing'));
+      log(t('logFlashing', { variant: pkg.id || '-', mode: manifest.flash.mode, freq: manifest.flash.freq, size: manifest.flash.size, erase: doErase ? t('eraseYes') : t('eraseNo') }));
+      setProgress(100, '100%');
+    } else {
+      const fl = manifest.flash || {};
+      setStatus(t('stFlashing'));
+      log(t('logFlashing', {
+        variant: pkg.id || '-', mode: fl.mode || 'dio', freq: fl.freq || '80m', size: fl.size || '4MB',
+        erase: doErase ? t('eraseYes') : t('eraseNo')
+      }));
+      await esploader.writeFlash({
+        fileArray,
+        flashMode: fl.mode || 'dio', flashFreq: fl.freq || '80m', flashSize: fl.size || '4MB',
+        eraseAll: doErase, compress: true,
+        reportProgress: (fileIndex, written, total) => {
+          const b = fileIndex / fileArray.length * 90;
+          const span = 1 / fileArray.length * 90;
+          setProgress(b + written / total * span);
+        }
+      });
+      log(t('logWriteDone'));
+      setProgress(100, t('stRestart'));
+      try { await esploader.after('hard_reset'); } catch (e) { log(t('logResetHint', { msg: e })); }
+      await releasePort();
+      await sleep(2000);
+    }
 
     let tail = t('tailNotProvisioned');
-    if (swChecked('sw-write')) {
+    const submit = submitAction();
+    const willSubmit = submit && (!submit.gate || ui.swChecked('sw-' + submit.gate));
+    if (willSubmit) {
       setProgress(100, t('stProvisioning'));
       try {
-        const r = await provisionOnPort(selectedPort);
-        tail = (r && r.skippedAll) ? t('tailSkipped') : t('tailProvisioned');
+        await ensureSerialPort();
+        const talker = await openTalker();
+        try { await runSession(talker, submit); } finally { await talker.close(); }
+        tail = t('tailProvisioned');
       } catch (e) {
         log(t('logProvisionFailed', { msg: e && e.message ? e.message : e }));
         tail = t('tailProvisionIncomplete');
@@ -805,107 +538,83 @@ btnFlash.addEventListener('click', async () => {
     log(t('logFlashFailed', { msg: e && e.message ? e.message : e }));
     setStatus(t('stFlashFail', { msg: e && e.message ? e.message : e }), 'err');
   } finally {
-    flashing = false;
-    btnConnect.disabled = false;
-    btnProvision.disabled = false;
-    btnClear.disabled = false;
-    btnConnect.textContent = connected ? t('btnConnected') : t('btnConnect');
-  }
-});
-
-async function ensureProvisionPort() {
-  if (transport || connected) { await releasePort(); await sleep(800); }
-  if (!selectedPort) {
-    setStatus(t('stSelectPort'));
-    selectedPort = await navigator.serial.requestPort();
+    setBusy(false);
   }
 }
 
-async function runProvisionOnly() {
-  setStatus(t('stProvisioning'));
-  const r = await provisionOnPort(selectedPort);
-  if (r && r.skippedAll) setStatus(t('stProvisionDoneNoCreds'), 'ok');
-  else if (r && r.wifiOk === false) setStatus(t('stProvisionWifiFail'), 'err');
-  else setStatus(t('stProvisionDone'), 'ok');
-}
-
-btnProvision.addEventListener('click', async () => {
-  if (flashing || provisionBusy) return;
-  if (!('serial' in navigator)) { browserWarn.classList.remove('hidden'); return; }
-  try {
-    provisionBusy = true;
-    btnProvision.disabled = true; btnFlash.disabled = true; btnClear.disabled = true;
-    await ensureProvisionPort();
-    await runProvisionOnly();
-  } catch (e) {
-    log(t('logProvisionFailed', { msg: e && e.message ? e.message : e }));
-    setStatus(t('stProvisionFail', { msg: e && e.message ? e.message : e }), 'err');
-  } finally {
-    provisionBusy = false;
-    btnProvision.disabled = false;
-    btnFlash.disabled = !connected;
-    btnClear.disabled = false;
-    btnConnect.disabled = connected;
-  }
+// ---------------------------------------------------------------- 日志导出
+btnExportLog.addEventListener('click', () => {
+  const text = logEl.textContent || '';
+  if (!text.trim()) { log(t('logExportEmpty')); return; }
+  const name = `ESPEZUpdater-log-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  log(t('logExported', { name }));
 });
 
-btnClear.addEventListener('click', async () => {
-  if (flashing || provisionBusy) return;
-  if (!('serial' in navigator)) { browserWarn.classList.remove('hidden'); return; }
-  try {
-    provisionBusy = true;
-    btnClear.disabled = true; btnProvision.disabled = true; btnFlash.disabled = true;
-    await ensureProvisionPort();
-    setStatus(t('stProvisioning'));
-    await clearOnPort(selectedPort);
-    setStatus(t('stCleared'), 'ok');
-  } catch (e) {
-    log(t('logProvisionFailed', { msg: e && e.message ? e.message : e }));
-    setStatus(t('stProvisionFail', { msg: e && e.message ? e.message : e }), 'err');
-  } finally {
-    provisionBusy = false;
-    btnClear.disabled = false;
-    btnProvision.disabled = false;
-    btnFlash.disabled = !connected;
-  }
-});
-
-// ============================================================================
-// 语言切换
-// ============================================================================
-btnLangZh.addEventListener('click', () => setLocale('zh'));
-btnLangEn.addEventListener('click', () => setLocale('en'));
+// ---------------------------------------------------------------- 语言切换
+$('lang-zh').addEventListener('click', () => setLocale('zh'));
+$('lang-en').addEventListener('click', () => setLocale('en'));
 onLocaleChange(() => {
-  const vals = profile ? captureValues() : {};
-  const sw = {
-    write: swChecked('sw-write'), update: swChecked('sw-update'),
-    override: swChecked('sw-override'), erase: swChecked('sw-erase')
-  };
-  applyStaticI18n();
+  const vals = profile ? ui.captureValues(profile, pkg ? pkg.id : '') : {};
+  const sw = switchState();
+  applyStatic();
   if (profile) {
-    renderSwitches();
+    ui.renderSwitches(switchesEl, eraseRow, profile, t);
     ['write', 'update', 'override'].forEach(k => { const el = $('sw-' + k); if (el) el.checked = sw[k]; });
     const e = $('sw-erase'); if (e) e.checked = sw.erase;
-    renderFields();
-    Object.entries(vals).forEach(([k, v]) => setControlValue(k, v));
-    applyShowWhen();
+    ui.renderFields(fieldsEl, profile, pkg.id, pickI18n);
+    Object.entries(vals).forEach(([k, v]) => ui.setControlValue(k, v));
+    ui.applyShowWhen(profile, ui.getControlValue);
+    ui.renderActions(actionsEl, profile.actions, {
+      t, pickI18n, labelOf,
+      onAction: a => { if (a.type === 'flash') doFlash(); else doSerialAction(a); }
+    });
+    refreshActionButtons();
+    if (manifest) loadManifest();
   }
-  if (manifest) loadManifest();
 });
 
-// ============================================================================
-// 初始化
-// ============================================================================
-initLocale();
-applyStaticI18n();
-if (!('serial' in navigator)) {
-  browserWarn.classList.remove('hidden');
-  btnConnect.disabled = true;
-  btnProvision.disabled = true;
-  btnClear.disabled = true;
-  setStatus(t('stNoWebSerial'), 'err');
-} else {
-  setStatus(t('stDisconnected'));
+// ---------------------------------------------------------------- 引导
+async function loadToolInfo() {
+  try {
+    const res = await fetch('version.json', { cache: 'no-store' });
+    if (res.ok) toolInfo = await res.json();
+  } catch (e) { /* keep defaults */ }
 }
-log(t('logReady'));
+
+async function bootstrap() {
+  await loadToolInfo();
+  initLocale();
+  applyStatic();
+  log(t('logReady'));
+  log(t('logToolVersion', { version: toolInfo.version }));
+  if (MOCK) log('MOCK mode enabled (?mock=1)');
+
+  if (!('serial' in navigator) && !MOCK) {
+    browserWarn.classList.remove('hidden');
+    setStatus(t('stNoWebSerial'), 'err');
+  } else {
+    setStatus(t('stDisconnected'));
+  }
+
+  try {
+    await activateSource(new StaticSource(), { silent: true });
+    importMsg.textContent = t('importMsgIdle');
+    log(t('logSourceBuiltin'));
+  } catch (e) {
+    if (MOCK) {
+      try { await activateSource(new DemoSource(), { silent: true }); log('MOCK demo source loaded'); return; }
+      catch (e2) { /* fall through */ }
+    }
+    importMsg.classList.remove('err');
+    importMsg.textContent = t('firmwareNotFound', { path: '/firmware/profile.json' });
+    log(t('firmwareNotFound', { path: '/firmware/profile.json' }));
+  }
+}
+
 bootstrap();

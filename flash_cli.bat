@@ -7,9 +7,11 @@ rem  flash_cli.bat -- command-line fallback (auto-detects variant and COM port;
 rem  parameters are read from manifest.json)
 rem
 rem  Usage:
-rem    flash_cli.bat                auto-pick the first variant with app.bin
-rem    flash_cli.bat <variant>      use the given variant
-rem    flash_cli.bat --no-erase     keep existing device config (default: erase all)
+rem    flash_cli.bat                       auto-pick the first variant with app.bin
+rem    flash_cli.bat <variant>             use the given variant
+rem    flash_cli.bat --variant <id>        use the given variant
+rem    flash_cli.bat --dir <path>          use an external firmware directory
+rem    flash_cli.bat --no-erase            keep existing device config (default: erase all)
 rem ============================================================================
 
 set "TOOLDIR=%~dp0"
@@ -19,14 +21,16 @@ set "FWROOT=%TOOLDIR%firmware"
 set "VARIANT="
 set "ERASE_ARG=--erase-all"
 set "ERASE_MSG=This will ERASE ALL flash (config will be cleared, need to reconfigure)."
-for %%A in (%*) do (
-    if /i "%%A"=="--no-erase" (
-        set "ERASE_ARG="
-        set "ERASE_MSG=Keeping existing config (NVS preserved)."
-    ) else (
-        set "VARIANT=%%A"
-    )
-)
+
+:parse
+if "%~1"=="" goto parsed
+if /i "%~1"=="--no-erase" ( set "ERASE_ARG=" & set "ERASE_MSG=Keeping existing config (NVS preserved)." & shift & goto parse )
+if /i "%~1"=="--dir" ( set "FWROOT=%~2" & shift & shift & goto parse )
+if /i "%~1"=="--variant" ( set "VARIANT=%~2" & shift & shift & goto parse )
+set "VARIANT=%~1"
+shift
+goto parse
+:parsed
 
 if not defined VARIANT (
     for /d %%D in ("%FWROOT%\*") do (
@@ -43,14 +47,15 @@ if "%VARIANT%"=="." (set "FW=%FWROOT%") else (set "FW=%FWROOT%\%VARIANT%")
 
 echo ============================================================
 echo   ESPEZUpdater - Firmware Flash (CLI fallback)
-echo   Variant: %VARIANT%
+echo   Firmware: %FW%
+echo   Variant : %VARIANT%
 echo   %ERASE_MSG%
 echo ============================================================
 echo.
 
 if not exist "%FW%\app.bin" (
     echo [ERROR] firmware package not found: %FW%\app.bin
-    echo         Run build_common.ps1 first, or pass a variant: flash_cli.bat ^<variant^>
+    echo         Build a package first, or pass --dir ^<path^> / --variant ^<id^>.
     pause
     exit /b 1
 )
@@ -96,6 +101,6 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo   Flash OK - device is restarting with the new firmware.
-echo   Note: CLI does not provision WiFi; use the web tool "Provision only".
+echo   Note: CLI does not provision; use the web tool to configure.
 echo ============================================================
 pause

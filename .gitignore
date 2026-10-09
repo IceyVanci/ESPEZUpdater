@@ -2,7 +2,10 @@
 build_tmp/
 firmware/
 dist/
+dist/exe_stage/
 *.zip
+*.exe
+*.sed
 
 # 套件内置的运行时工具副本（项目侧，不入工具仓）
 build-kit/runtime/
@@ -18,3 +21,6 @@ sdkconfig
 .idea/
 Thumbs.db
 desktop.ini
+
+# 内部规划文档（仅供参考，不纳入版本库）
+ESPEZUpdater_改进计划书_v2.md

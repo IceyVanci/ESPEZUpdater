@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# 强制按二进制处理，避免误做行尾/编码归一化
+*.exe binary
+*.bin binary
+*.ico binary
+*.png binary
+*.zip binary
