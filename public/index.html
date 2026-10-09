@@ -27,21 +27,26 @@
   <div class="card" id="import-card">
     <div class="card-title" data-i18n="sectionImport">导入固件</div>
     <div id="import-drop" class="drop-zone">
-      <button id="btn-import" class="btn" type="button" data-i18n="importBtn"></button>
+      <div class="drop-actions">
+        <button id="btn-import" class="btn" type="button" data-i18n="importBtn"></button>
+        <button id="btn-import-zip" class="btn" type="button" data-i18n="importZipBtn"></button>
+      </div>
       <div class="drop-hint" data-i18n="importDrop"></div>
     </div>
     <input id="file-input" type="file" webkitdirectory multiple class="hidden">
+    <input id="zip-input" type="file" accept=".zip,application/zip" class="hidden">
     <div id="import-msg" class="muted"></div>
+    <div class="import-note" data-i18n="importLocalNote"></div>
   </div>
 
-  <div class="card" id="fw-card">
+  <div class="card hidden" id="fw-card">
     <div class="card-title" data-i18n="sectionFirmware">固件包信息</div>
     <div id="variants" class="mode-select"></div>
     <div id="fw-badge" class="badges"></div>
     <div id="fw-info" class="muted">…</div>
   </div>
 
-  <div class="card" id="config-card">
+  <div class="card hidden" id="config-card">
     <div class="card-title" data-i18n="sectionConfig">配置项</div>
     <div id="fields"></div>
     <div id="switches" class="switch-row"></div>

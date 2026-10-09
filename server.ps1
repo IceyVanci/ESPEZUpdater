@@ -64,7 +64,7 @@ function Resolve-Request([string]$rawPath, [ref]$outPath, [ref]$outType) {
         $outType.Value = Get-MimeFor $clean
     } else {
         $clean = $clean -replace '/', '\'
-        if ($clean -like '\firmware*') {
+        if ($clean -eq '\firmware' -or $clean -like '\firmware\*') {
             $rel = $clean.Substring('\firmware'.Length)
             $outPath.Value = Get-SafeFilePath -baseDir $FwDir -relPath $rel
             $outType.Value = Get-MimeFor $rel

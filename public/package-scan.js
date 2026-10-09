@@ -1,7 +1,9 @@
 // ============================================================================
 // package-scan.js —— 目录扫描与严格校验
 //   输入：归一化后的条目数组 [{ path, file }]（file 为浏览器的 File 对象）
-//   输出：候选“固件包根”列表；严格模式：manifest 所在目录必须有 profile 祖先。
+//   scanEntries() 返回候选 { profileDirs(浅→深), manifestDirs, errors }；
+//   validatePackage(root, profile, manifestDirs) 按“该根之下的 manifest”与
+//   profile.variants 精确比对，选出真正自洽的包根（容错变体目录内的 profile 副本）。
 // ============================================================================
 
 export function normalizePath(p) {
@@ -33,9 +35,10 @@ export function entriesFromFileList(fileList, displayName) {
   return { entries, displayName: displayName || 'firmware' };
 }
 
-// 扫描条目，返回 { roots, errors }
-//   roots: [{ root, profilePath, manifestDirs: [dir,...] }]
-//   errors: [{ type:'missingProfile', dir, file }]
+// 扫描条目，返回候选集合 { profileDirs, manifestDirs, errors }
+//   profileDirs : 含 profile.json 的目录（按深度由浅到深排序）
+//   manifestDirs: 含 manifest.json 的目录
+//   errors      : manifest 找不到 profile 祖先的项
 export function scanEntries(entries) {
   const paths = new Set(entries.map(e => normalizePath(e.path)));
   const profileDirs = new Set();
@@ -46,37 +49,34 @@ export function scanEntries(entries) {
   }
 
   const errors = [];
-  const rootMap = new Map();
   for (const md of manifestDirs) {
-    const root = nearestIn(profileDirs, md);
-    if (root === null) {
-      errors.push({ type: 'missingProfile', dir: md, file: joinPath(md, 'profile.json') });
-      continue;
+    let d = md;
+    let found = false;
+    for (;;) {
+      if (profileDirs.has(d)) { found = true; break; }
+      if (d === '') break;
+      d = dirName(d);
     }
-    if (!rootMap.has(root)) rootMap.set(root, new Set());
-    rootMap.get(root).add(md);
+    if (!found) errors.push({ type: 'missingProfile', dir: md, file: joinPath(md, 'profile.json') });
   }
 
-  const roots = [];
-  for (const [root, mds] of rootMap) {
-    roots.push({ root, profilePath: joinPath(root, 'profile.json'), manifestDirs: [...mds] });
-  }
-  return { roots, errors };
+  const profiles = [...profileDirs].sort((a, b) => depth(a) - depth(b));
+  return { profileDirs: profiles, manifestDirs: [...manifestDirs], errors };
 }
 
-function nearestIn(dirSet, start) {
-  let d = start;
-  for (;;) {
-    if (dirSet.has(d)) return d;
-    if (d === '') return null;
-    d = dirName(d);
-  }
+export function depth(dir) {
+  return dir ? dir.split('/').length : 0;
 }
 
-// 校验一个包根：profile.variants 与 manifest 目录必须严格对应
-//   profile 内容已知时调用，返回 { variants:[{id,base}], errors:[msg] }
+// root 是否包含 dir（root==='' 视为包含全部）
+export function isUnder(dir, root) {
+  if (root === '') return true;
+  return dir === root || dir.startsWith(root + '/');
+}
+
+// 校验一个包根：profile.variants 与“该根之下”的 manifest 目录必须严格对应
+//   profile 内容已知时调用，返回 { variants:[{id,base,label}], errors:[...] }
 export function validatePackage(root, profile, manifestDirs) {
-  const dirSet = new Set(manifestDirs);
   const errors = [];
   const variants = [];
   const declared = (profile && profile.variants && profile.variants.length)
@@ -88,7 +88,7 @@ export function validatePackage(root, profile, manifestDirs) {
     const base = baseFor(root, v.id);
     const baseDir = base.replace(/\/$/, '');
     expected.add(baseDir);
-    if (!dirSet.has(baseDir)) {
+    if (!manifestDirs.includes(baseDir)) {
       errors.push({
         type: 'missingManifest',
         dir: baseDir,
@@ -98,6 +98,7 @@ export function validatePackage(root, profile, manifestDirs) {
     variants.push({ id: v.id || '', base, label: (v && v.label) || (profile && profile.product) });
   }
   for (const md of manifestDirs) {
+    if (!isUnder(md, root)) continue;
     if (!expected.has(md)) {
       errors.push({ type: 'unexpectedManifest', dir: md, file: joinPath(md, 'manifest.json') });
     }
@@ -106,7 +107,6 @@ export function validatePackage(root, profile, manifestDirs) {
 }
 
 export function baseFor(root, vid) {
-  let base = joinPath(root, vid || '');
-  if (base) base += '/';
-  return base;
+  if (!vid) return root ? root.replace(/\/+$/, '') + '/' : '';
+  return joinPath(root, vid) + '/';
 }

@@ -11,7 +11,7 @@
 //     src.rootProfile / src.displayName / src.kind
 // ============================================================================
 
-import { normalizePath, joinPath, baseFor, scanEntries, validatePackage, entriesFromFileList } from './package-scan.js';
+import { normalizePath, joinPath, isUnder, scanEntries, validatePackage, entriesFromFileList } from './package-scan.js';
 
 async function fetchJSON(path) {
   const res = await fetch(path, { cache: 'no-store' });
@@ -100,21 +100,37 @@ export class DirectorySource {
 
   async load() {
     const entries = [...this.store._map.entries()].map(([path, e]) => ({ path, file: e.file }));
-    const { roots, errors } = scanEntries(entries);
-    const errList = [...errors];
-    if (!roots.length && !errList.length) errList.push({ type: 'nopackage', dir: '', file: 'profile.json' });
+    const scan = scanEntries(entries);
+    const errList = [...scan.errors];
 
-    const multi = roots.length > 1;
-    const packages = [];
-    for (const r of roots) {
+    // 候选包根按深度由浅到深；接受第一个“自洽”的根，跳过被其包含的更深候选
+    const accepted = [];
+    for (const root of scan.profileDirs) {
+      if (accepted.some(a => isUnder(root, a.root))) continue;
       let profile;
-      try { profile = await this.store.readJSON(r.profilePath); }
-      catch (e) { errList.push({ type: 'missingProfile', dir: r.root, file: r.profilePath }); continue; }
-      this._profiles.set(r.root, profile);
-      const { variants, errors: verr } = validatePackage(r.root, profile, r.manifestDirs);
-      errList.push(...verr);
-      const group = multi ? (r.root || this.displayName) : '';
-      for (const v of variants) {
+      try { profile = await this.store.readJSON(joinPath(root, 'profile.json')); }
+      catch (e) { errList.push({ type: 'missingProfile', dir: root, file: joinPath(root, 'profile.json') }); continue; }
+      const { variants, errors: verr } = validatePackage(root, profile, scan.manifestDirs);
+      if (verr.length === 0) {
+        this._profiles.set(root, profile);
+        accepted.push({ root, profile, variants });
+      } else {
+        errList.push(...verr);
+      }
+    }
+
+    if (!accepted.length) {
+      const err = new Error('firmware package validation failed');
+      err.code = 'scan';
+      err.errors = errList.length ? errList : [{ type: 'nopackage', dir: '', file: 'profile.json' }];
+      throw err;
+    }
+
+    const multi = accepted.length > 1;
+    const packages = [];
+    for (const a of accepted) {
+      const group = multi ? (a.root || this.displayName) : '';
+      for (const v of a.variants) {
         packages.push({
           id: v.id,
           base: v.base,
@@ -122,25 +138,13 @@ export class DirectorySource {
           profilePath: v.base + 'profile.json',
           label: v.label,
           group,
-          root: r.root
+          root: a.root
         });
       }
     }
 
-    if (errList.length) {
-      const err = new Error('firmware package validation failed');
-      err.code = 'scan';
-      err.errors = errList;
-      throw err;
-    }
-    if (!packages.length) {
-      const err = new Error('no firmware package found');
-      err.code = 'nopackage';
-      throw err;
-    }
-
     this._packages = packages;
-    this.rootProfile = this._profiles.get(packages[0].root) || null;
+    this.rootProfile = accepted[0].profile;
   }
 
   packages() { return this._packages; }
@@ -208,6 +212,24 @@ export class DemoSource {
     const f = this.manifestObj.files.find(x => x.name === name);
     return new Uint8Array(f ? f.size : 16);
   }
+}
+
+// 拖拽/选择目录：来自 File System Access API 的 FileSystemDirectoryHandle
+export async function entriesFromDirectoryHandle(handle) {
+  const entries = [];
+  async function walk(dir, prefix) {
+    for await (const [name, h] of dir.entries()) {
+      const path = joinPath(prefix, name);
+      if (h.kind === 'file') {
+        const file = await h.getFile();
+        entries.push({ path, file });
+      } else if (h.kind === 'directory') {
+        await walk(h, path);
+      }
+    }
+  }
+  await walk(handle, '');
+  return { entries, displayName: handle.name };
 }
 
 // 构造 DirectorySource 的辅助：来自 <input webkitdirectory>

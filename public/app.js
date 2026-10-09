@@ -5,7 +5,7 @@
 
 import { ESPLoader, Transport } from './esptool-js/bundle.js';
 import { initLocale, getLocale, setLocale, setDefaultLocale, onLocaleChange, t, pickI18n } from './i18n.js';
-import { StaticSource, DirectorySource, DemoSource, sourceFromFileList, entriesFromDataTransfer } from './firmware-source.js';
+import { StaticSource, DirectorySource, DemoSource, sourceFromFileList, entriesFromDataTransfer, entriesFromDirectoryHandle } from './firmware-source.js';
 import { readZip } from './zip.js';
 import { normalizeProfile } from './profile-model.js';
 import { SerialTalker, MockTalker } from './protocol.js';
@@ -20,9 +20,14 @@ const toolVersionEl = $('tool-version');
 const sourceBadge = $('source-badge');
 const importDrop = $('import-drop');
 const btnImport = $('btn-import');
+const btnImportZip = $('btn-import-zip');
 const fileInput = $('file-input');
+const zipInput = $('zip-input');
 const importMsg = $('import-msg');
+const importCard = $('import-card');
 const variantsEl = $('variants');
+const fwCard = $('fw-card');
+const configCard = $('config-card');
 const fwBadge = $('fw-badge');
 const fwInfo = $('fw-info');
 const fieldsEl = $('fields');
@@ -114,6 +119,19 @@ function updateSourceBadge() {
   else sourceBadge.textContent = t('sourceImported', { name: source.displayName });
 }
 
+// 未加载固件时：隐藏空卡片并高亮导入区
+function setFirmwareReady(ready) {
+  fwCard.classList.toggle('hidden', !ready);
+  configCard.classList.toggle('hidden', !ready);
+  importCard.classList.toggle('promo', !ready);
+  if (!ready) {
+    actionsEl.innerHTML = '';
+    fwBadge.innerHTML = '';
+    fwInfo.textContent = '';
+    credStatus.classList.add('hidden');
+  }
+}
+
 // ---------------------------------------------------------------- 来源激活
 async function activateSource(src, opts = {}) {
   await src.load();
@@ -128,6 +146,7 @@ async function activateSource(src, opts = {}) {
     if (src.kind === 'dir') log(t('logSourceImported', { name: src.displayName }));
   }
   await selectPackage(pkgs[0]);
+  setFirmwareReady(!!profile);
 }
 
 async function selectPackage(p) {
@@ -233,13 +252,58 @@ async function importEntries(entries, displayName) {
   }
 }
 
-btnImport.addEventListener('click', () => fileInput.click());
+async function importZipFile(file) {
+  try {
+    const map = await readZip(await file.arrayBuffer());
+    const entries = [...map].map(([path, bytes]) => ({ path, bytes }));
+    await importEntries(entries, file.name.replace(/\.zip$/i, ''));
+  } catch (err) {
+    showImportError(err);
+  }
+}
+
+// 目录：优先 File System Access API（对话框为“选择文件夹”，无“上传”字样），回退 <input webkitdirectory>
+btnImport.addEventListener('click', async () => {
+  if (typeof window.showDirectoryPicker === 'function') {
+    try {
+      const handle = await window.showDirectoryPicker({ mode: 'read' });
+      const { entries, displayName } = await entriesFromDirectoryHandle(handle);
+      await importEntries(entries, displayName);
+      return;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+    }
+  }
+  fileInput.click();
+});
 fileInput.addEventListener('change', async () => {
   if (!fileInput.files || !fileInput.files.length) return;
   const src = sourceFromFileList(fileInput.files, '');
   try { await activateSource(src); }
   catch (err) { showImportError(err); }
   fileInput.value = '';
+});
+
+// zip：优先 showOpenFilePicker（对话框为“打开”），回退普通文件选择
+btnImportZip.addEventListener('click', async () => {
+  if (typeof window.showOpenFilePicker === 'function') {
+    try {
+      const [handle] = await window.showOpenFilePicker({
+        multiple: false,
+        types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }]
+      });
+      await importZipFile(await handle.getFile());
+      return;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+    }
+  }
+  zipInput.click();
+});
+zipInput.addEventListener('change', async () => {
+  if (!zipInput.files || !zipInput.files.length) return;
+  await importZipFile(zipInput.files[0]);
+  zipInput.value = '';
 });
 
 ['dragenter', 'dragover'].forEach(ev => importDrop.addEventListener(ev, e => {
@@ -252,9 +316,7 @@ importDrop.addEventListener('drop', async e => {
   const files = [...(e.dataTransfer.files || [])];
   try {
     if (files.length === 1 && /\.zip$/i.test(files[0].name)) {
-      const map = await readZip(await files[0].arrayBuffer());
-      const entries = [...map].map(([path, bytes]) => ({ path, bytes }));
-      await importEntries(entries, files[0].name.replace(/\.zip$/i, ''));
+      await importZipFile(files[0]);
       return;
     }
     const { entries, displayName } = await entriesFromDataTransfer(e.dataTransfer.items);
@@ -612,7 +674,9 @@ async function bootstrap() {
       catch (e2) { /* fall through */ }
     }
     importMsg.classList.remove('err');
-    importMsg.textContent = t('firmwareNotFound', { path: '/firmware/profile.json' });
+    importMsg.textContent = t('importFirstHint');
+    setFirmwareReady(false);
+    if ('serial' in navigator || MOCK) setStatus(t('stNeedImport'));
     log(t('firmwareNotFound', { path: '/firmware/profile.json' }));
   }
 }

@@ -20,8 +20,11 @@ export const DICT = {
 
     // 导入
     importBtn: '选择固件目录…',
+    importZipBtn: '选择 zip 文件…',
     importDrop: '或将固件目录 / .zip 拖拽到此处',
+    importLocalNote: '文件仅在本机浏览器内读取，不会上传到网络。',
     importMsgIdle: '未导入：正在使用工具内置固件。',
+    importFirstHint: '尚未导入固件：请点击「选择固件目录…」，或把包含 manifest.json 与 profile.json 的目录 / zip 拖到此处。',
     importOk: '已导入：{name}（{count} 个固件包）',
     importStrictError: '导入失败（严格模式需同时含 manifest.json 与 profile.json）：',
     importMissing: '缺少 {file}',
@@ -67,6 +70,7 @@ export const DICT = {
 
     // 状态
     stDisconnected: '未连接设备',
+    stNeedImport: '请先导入固件',
     stSelectPort: '请选择设备串口…',
     stHandshaking: '正在握手（设备会自动复位进入下载模式）…',
     stConnected: '已连接 {chip}，可以开始升级或配置',
@@ -187,8 +191,11 @@ export const DICT = {
     sectionImport: 'Import firmware',
 
     importBtn: 'Choose firmware folder…',
+    importZipBtn: 'Choose zip file…',
     importDrop: 'or drop a firmware folder / .zip here',
+    importLocalNote: 'Files are read locally in your browser and are never uploaded.',
     importMsgIdle: 'Not imported: using the built-in firmware.',
+    importFirstHint: 'No firmware imported yet: click "Choose firmware folder…" or drop a folder / zip containing manifest.json and profile.json here.',
     importOk: 'Imported: {name} ({count} package(s))',
     importStrictError: 'Import failed (strict mode requires manifest.json + profile.json):',
     importMissing: 'missing {file}',
@@ -230,6 +237,7 @@ export const DICT = {
     swEraseHelp: 'Clears all device config (including saved values); re-provisioning required',
 
     stDisconnected: 'No device connected',
+    stNeedImport: 'Import firmware first',
     stSelectPort: 'Select the device serial port…',
     stHandshaking: 'Handshaking (device auto-resets into download mode)…',
     stConnected: 'Connected {chip}, ready to flash or configure',
