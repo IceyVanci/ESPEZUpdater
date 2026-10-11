@@ -16,35 +16,10 @@
 - 构建套件与项目集成机制：`docs\03_构建套件与项目集成机制.md`
 - 套件用法速查：`build-kit\README.md`
 
-## 目录结构
+## 已使用本工具的项目
 
-```
-ESPEZUpdater\
-├─ server.ps1            本地静态服务（127.0.0.1，端口冲突自动顺延；服务 public\ 与 firmware\）
-├─ 一键升级.bat          启动服务并打开浏览器
-├─ upgrade.bat           英文同义启动器
-├─ flash_cli.bat         命令行兜底（读 manifest.json；支持 --variant / --dir / --no-erase）
-├─ esptool.exe           命令行烧录工具
-├─ pack.ps1              打包发布（运行时 zip / 构建套件 zip / 可选单文件 EXE）
-├─ version.json / VERSION 工具版本（日期格式 YYYYMMDD）
-├─ public\               通用网页外壳
-│  ├─ index.html / style.css
-│  ├─ app.js             编排层（来源 → profile → 渲染 → 动作）
-│  ├─ firmware-source.js 来源抽象（内置静态 / 本地目录）
-│  ├─ package-scan.js    目录扫描与严格校验
-│  ├─ profile-model.js   profile 归一化与 schema 门禁（schema 1 / 2）
-│  ├─ protocol.js        串口会话（SerialTalker）与模拟（MockTalker）
-│  ├─ operations.js      通用动作载荷构建
-│  ├─ ui.js              通用渲染
-│  ├─ zip.js             最小 ZIP 读取（拖入 .zip 用）
-│  ├─ i18n.js            中英双语字典
-│  └─ esptool-js\bundle.js
-├─ build-kit\            ★ 独立构建套件（供项目内置取用）
-│  ├─ build_common.ps1 / empty_creds.ps1
-│  ├─ templates\{build,profile}.example.json
-│  └─ README.md
-└─ docs\                 设计与接入文档（01–04）
-```
+- **ESP 虚拟键盘**（ESP Virtual Keyboard）— <https://github.com/IceyVanci/ESPVirtualKeyboard>
+- **ESP 桌面时钟**（ESP Desktop Clock）— <https://github.com/IceyVanci/ESPDesktopClock>
 
 ## 使用
 
