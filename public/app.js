@@ -8,7 +8,7 @@ import { initLocale, getLocale, setLocale, setDefaultLocale, onLocaleChange, t, 
 import { StaticSource, DirectorySource, DemoSource, sourceFromFileList, entriesFromDataTransfer, entriesFromDirectoryHandle } from './firmware-source.js';
 import { readZip } from './zip.js';
 import { normalizeProfile } from './profile-model.js';
-import { SerialTalker, MockTalker } from './protocol.js';
+import { SerialTalker, MockTalker, sendAndConfirm } from './protocol.js';
 import { computeVisibility, buildActionPayload, dataKeysOf } from './operations.js';
 import * as ui from './ui.js';
 
@@ -327,11 +327,18 @@ importDrop.addEventListener('drop', async e => {
 });
 
 // ---------------------------------------------------------------- 串口工具
+// 提交确认参数（对应 接入与使用说明.md「写入时序与可靠性」）
+const STABILIZE_MS = 4000;      // 刷机后自动提交前等待（规范 3–5s，取中值）
+const SUBMIT_ATTEMPTS = 4;      // 首发 + 最多 3 次重试
+const SUBMIT_TIMEOUT_MS = 15000;
+const CONFIRM_SETTLE_MS = 500;  // 重试前写 '\n' 后等待设备消化残行
+
 function attachLog(talker) {
   talker.onEvent = msg => log(t('logDeviceMsg', { msg: JSON.stringify(msg) }));
   talker.onLine = line => log(t('logDevice', { line }));
   talker.onParseFail = line => log(t('logParseFail', { line }));
   talker.onSend = (obj, line) => log(t('logSend', { msg: line }));
+  talker.onChunks = n => log(t('logChunkedSend', { n }));
 }
 
 async function openSerialWithRetry(port, tries = 12, gapMs = 500) {
@@ -349,7 +356,12 @@ async function openSerialWithRetry(port, tries = 12, gapMs = 500) {
 }
 
 function newMockTalker() {
-  return new MockTalker({ protocol: profile.protocol, variantId: pkg.id, proto: profile.proto });
+  const q = new URLSearchParams(location.search);
+  const drop = parseInt(q.get('mockDrop') || '0', 10);
+  return new MockTalker({
+    protocol: profile.protocol, variantId: pkg.id, proto: profile.proto,
+    dropCreds: isNaN(drop) ? 0 : drop
+  });
 }
 
 // ---------------------------------------------------------------- 连接
@@ -434,7 +446,7 @@ async function openTalker() {
 }
 
 // ---------------------------------------------------------------- 串口会话
-async function runSession(talker, action) {
+async function runSession(talker, action, opts = {}) {
   const proto = profile.protocol;
   let pong = null;
   for (let i = 0; i < 15 && !pong; i++) {
@@ -449,6 +461,13 @@ async function runSession(talker, action) {
   }
   if (pong.mode != null && pkg && pkg.id && pong.mode !== pkg.id) {
     log(t('logModeMismatch', { device: pong.mode, selected: pkg.id }));
+  }
+
+  if (opts.stabilizeMs) {
+    const sec = opts.stabilizeMs / 1000;
+    log(t('logStabilize', { sec }));
+    setStatus(t('stStabilizing', { sec }));
+    await sleep(opts.stabilizeMs);
   }
 
   talker.resetEvents();
@@ -475,17 +494,36 @@ async function runSession(talker, action) {
     return { pong, skipped: true };
   }
 
-  talker.resetEvents();
-  await talker.send(payload);
+  const isSubmit = action.type === 'submit';
   if (action.waitFor && action.waitFor.length) {
     let saved = null;
-    try { saved = await talker.waitFor(action.waitFor, action.timeoutMs || 8000); }
-    catch (e) { throw new Error(t('errActionTimeout', { evt: action.waitFor.join(' / ') })); }
+    try {
+      const r = await sendAndConfirm(talker, payload, action.waitFor, {
+        attempts: isSubmit ? SUBMIT_ATTEMPTS : 1,
+        timeoutMs: action.timeoutMs || (isSubmit ? SUBMIT_TIMEOUT_MS : 8000),
+        settleMs: CONFIRM_SETTLE_MS,
+        rejectEvts: [proto.errorEvt],
+        onRetry: info => log(t('logSubmitRetry', {
+          n: info.attempt, total: info.total,
+          msg: (info.error && info.error.message) || ''
+        }))
+      });
+      saved = r.saved;
+    } catch (e) {
+      const evts = action.waitFor.join(' / ');
+      const tries = isSubmit ? SUBMIT_ATTEMPTS : 1;
+      throw new Error(t('errSaveTimeout', {
+        evt: evts, tries, msg: (e.cause && e.cause.message) || e.message
+      }));
+    }
     if (saved && (saved.groups || saved.skipped)) {
       const written = (saved.groups || []).join(', ') || '-';
       if (saved.skipped && saved.skipped.length) log(t('logCredsSavedSkip', { written, skipped: saved.skipped.join(', ') }));
       else log(t('logCredsSaved', { written }));
     }
+  } else {
+    talker.resetEvents();
+    await talker.send(payload);
   }
 
   let wifiOk;
@@ -579,6 +617,7 @@ async function doFlash() {
     }
 
     let tail = t('tailNotProvisioned');
+    let provFail = null;
     const submit = submitAction();
     const willSubmit = submit && (!submit.gate || ui.swChecked('sw-' + submit.gate));
     if (willSubmit) {
@@ -586,16 +625,22 @@ async function doFlash() {
       try {
         await ensureSerialPort();
         const talker = await openTalker();
-        try { await runSession(talker, submit); } finally { await talker.close(); }
+        try { await runSession(talker, submit, { stabilizeMs: STABILIZE_MS }); } finally { await talker.close(); }
         tail = t('tailProvisioned');
       } catch (e) {
+        provFail = e;
         log(t('logProvisionFailed', { msg: e && e.message ? e.message : e }));
         tail = t('tailProvisionIncomplete');
       }
     }
     setProgress(100, '100%');
-    setStatus(t('stDone', { tail }), 'ok');
-    showModal('✅', t('stDone', { tail }));
+    if (provFail) {
+      setStatus(t('stDoneConfigFail'), 'err');
+      showModal('⚠', t('stDoneConfigFail'));
+    } else {
+      setStatus(t('stDone', { tail }), 'ok');
+      showModal('✅', t('stDone', { tail }));
+    }
   } catch (e) {
     log(t('logFlashFailed', { msg: e && e.message ? e.message : e }));
     setStatus(t('stFlashFail', { msg: e && e.message ? e.message : e }), 'err');
